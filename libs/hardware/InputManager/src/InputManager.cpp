@@ -8,6 +8,9 @@
 #include <Wire.h>
 #include <I2cBusLock.h>
 #include <driver/gpio.h>
+#if FREEINK_TOUCH_TMA525C
+#include <Logging.h>
+#endif
 #if FREEINK_DEVICE_PICCO
 #include <driver/rtc_io.h>
 #endif
@@ -188,10 +191,14 @@ uint8_t InputManager::getState() {
   if (BoardConfig::ACTIVE.inputStyle == BoardConfig::InputStyle::OnePageAdcLadder) {
     if (BoardConfig::ACTIVE.input.adcLadderPin >= 0) {
       const int mv = analogReadMilliVolts(BoardConfig::ACTIVE.input.adcLadderPin);
-      if (mv >= 2400 && mv <= 2800)      state |= (1 << BTN_BACK);    // ~2592 mV
-      else if (mv >= 1780 && mv <= 2140) state |= (1 << BTN_LEFT);    // ~1956 mV
-      else if (mv >= 1140 && mv <= 1500) state |= (1 << BTN_RIGHT);   // ~1316 mV
-      else if (mv >= 0 && mv <= 250)     state |= (1 << BTN_CONFIRM); // ~0 mV (ENTER)
+      if (mv >= 2400 && mv <= 2800)
+        state |= (1 << BTN_BACK);  // ~2592 mV
+      else if (mv >= 1780 && mv <= 2140)
+        state |= (1 << BTN_LEFT);  // ~1956 mV
+      else if (mv >= 1140 && mv <= 1500)
+        state |= (1 << BTN_RIGHT);  // ~1316 mV
+      else if (mv >= 0 && mv <= 250)
+        state |= (1 << BTN_CONFIRM);  // ~0 mV (ENTER)
     }
     if (BoardConfig::ACTIVE.input.up >= 0 && digitalRead(BoardConfig::ACTIVE.input.up) == LOW) {
       state |= (1 << BTN_UP);
@@ -727,7 +734,11 @@ InputManager::TouchPoint InputManager::getTouchPoint() const { return touchPoint
 
 bool InputManager::supportsMultiTouch() const {
 #if FREEINK_CAP_TOUCH
-  return touchDataEnabled && BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Gt911;
+  if (!touchDataEnabled) return false;
+#if FREEINK_TOUCH_TMA525C
+  if (BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Tma525c) return piccoMaxContacts >= 2;
+#endif
+  return BoardConfig::ACTIVE.touch.controller == BoardConfig::TouchController::Gt911;
 #else
   return false;
 #endif
@@ -1666,7 +1677,7 @@ void InputManager::beginFt5x06() {
 namespace {
 volatile bool cstInterrupt = false;
 void IRAM_ATTR cstTouchInterrupt() { cstInterrupt = true; }
-}
+}  // namespace
 
 void InputManager::beginCst816s() {
   const auto& t = BoardConfig::ACTIVE.touch;
@@ -1709,7 +1720,10 @@ void InputManager::pollCst816s(const unsigned long now) {
   };
   // Re-reading CST816S can return the last sample after its event ends.
   // A stale successful read must not keep a contact pressed forever either.
-  if (active && !fresh && now - cstLastSample >= 100) { release(); return; }
+  if (active && !fresh && now - cstLastSample >= 100) {
+    release();
+    return;
+  }
   uint8_t data[5] = {};
   if (!ft5x06ReadReg(0x02, data, sizeof(data))) {
     // The device goes silent again after release; don't latch a key/contact.
@@ -1726,8 +1740,14 @@ void InputManager::pollCst816s(const unsigned long now) {
   if (BoardConfig::isMetalioEInk4() && rawY >= 800) {
     // Vendor cover key centers: HOME=(80,900), NEXT=(240,900), PREV=(400,900).
     // Ignore invalid off-panel samples rather than clamping them into screen taps.
-    if (rawY < 860 || rawY > 940 || rawX > 479) { release(); return; }
-    if (touchPressed) { suppressTouchContact(); release(); }
+    if (rawY < 860 || rawY > 940 || rawX > 479) {
+      release();
+      return;
+    }
+    if (touchPressed) {
+      suppressTouchContact();
+      release();
+    }
     if (rawX < 160) {
       cstVirtualButtons = 0;
       if (!touchHomeKeyDown) {
@@ -1748,9 +1768,12 @@ void InputManager::pollCst816s(const unsigned long now) {
   if (touchHomeKeyDown || cstVirtualButtons) release();
   const uint16_t x = t.swapXY ? rawY : rawX;
   const uint16_t y = t.swapXY ? rawX : rawY;
-  if (x < t.rawMinX || x > t.rawMaxX || y < t.rawMinY || y > t.rawMaxY) { release(); return; }
+  if (x < t.rawMinX || x > t.rawMaxX || y < t.rawMinY || y > t.rawMaxY) {
+    release();
+    return;
+  }
   touchPoint = {true, mapTouchAxis(x, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX),
-                     mapTouchAxis(y, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY), now};
+                mapTouchAxis(y, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY), now};
   if (t.flipX) touchPoint.x = t.rawMaxX - t.rawMinX - touchPoint.x;
   if (t.flipY) touchPoint.y = t.rawMaxY - t.rawMinY - touchPoint.y;
   if (!touchPressed) {
@@ -2158,7 +2181,8 @@ constexpr unsigned long PICCO_TOUCH_STALE_MS = 3000;
 // One PIP report into buf (at most cap bytes); returns its length, 0 if none.
 uint16_t piccoReadReport(uint8_t addr, uint8_t* buf, uint16_t cap) {
   if (Wire.requestFrom(addr, static_cast<uint8_t>(2), static_cast<uint8_t>(true)) != 2) return 0;
-  const uint16_t len = Wire.read() | (Wire.read() << 8);
+  const uint8_t low = Wire.read();
+  const uint16_t len = low | (static_cast<uint16_t>(Wire.read()) << 8);
   if (len < 2 || len > cap) return 0;
   const uint8_t got = Wire.requestFrom(addr, static_cast<uint8_t>(len), static_cast<uint8_t>(true));
   for (uint8_t i = 0; i < got; ++i) buf[i] = Wire.read();
@@ -2186,6 +2210,7 @@ uint16_t piccoCrc(const uint8_t* p, size_t n) {
 }  // namespace
 
 void InputManager::beginTma525c() {
+  piccoMaxContacts = 1;
   const auto& t = BoardConfig::ACTIVE.touch;
   if (t.sda < 0 || t.scl < 0 || t.i2cAddress == 0) return;
 
@@ -2239,6 +2264,32 @@ void InputManager::beginTma525c() {
     mode = PICCO_MODE_APP;  // stock proceeds once the launch is acknowledged
   }
   touchDataEnabled = (mode == PICCO_MODE_APP);
+  if (touchDataEnabled) {
+    // PIP GET_SYSINFO (as documented by Linux cyttsp5): sensing data starts at
+    // byte 33; byte 50 is max_num_of_tch_per_refresh_cycle. Query the panel's
+    // configuration rather than assuming the controller family's finger limit.
+    static constexpr uint8_t sysinfo[] = {0x04, 0x00, 0x05, 0x00, 0x2F, 0x00, 0x02};
+    bool capabilityConfirmed = false;
+    Wire.beginTransmission(t.i2cAddress);
+    Wire.write(sysinfo, sizeof(sysinfo));
+    if (Wire.endTransmission() == 0) {
+      const unsigned long startedAt = millis();
+      for (uint8_t attempt = 0; attempt < 8; ++attempt) {
+        const unsigned long elapsed = millis() - startedAt;
+        if (elapsed >= 500 || !piccoWaitInt(t.irq, 500 - elapsed)) break;
+        const uint16_t len = piccoReadReport(t.i2cAddress, buf, sizeof(buf));
+        if (len >= 51 && buf[2] == 0x1F && (buf[4] & 0x7F) == 0x02 && buf[50] > 0 && buf[50] <= 31) {
+          piccoMaxContacts = buf[50];
+          capabilityConfirmed = true;
+          break;
+        }
+      }
+    }
+    if (!capabilityConfirmed)
+      LOG_ERR("INPUT", "Picco multi-touch capability query failed; keeping single touch");
+    else
+      LOG_INF("INPUT", "Picco touch reports up to %u contacts", piccoMaxContacts);
+  }
 #ifdef TOUCH_PROBE_DEBUG
   touchDebugPrintf("[touch] Picco TMA525C mode=0x%02X enabled=%d\r\n", mode, touchDataEnabled);
 #endif
@@ -2252,7 +2303,10 @@ void InputManager::pollTma525c(const unsigned long now) {
   // controller can go quiet while a finger rests still, so the hold-over is only
   // a long safety net for a missed lift-off (it must outlast a long press).
   if (t.irq >= 0 && digitalRead(t.irq) != LOW) {
-    if (touchPressed && now >= touchReleaseAt) {
+    if (touchPressed && now - touchPoint.timestamp >= PICCO_TOUCH_STALE_MS) {
+      cancelMultiTouchGesture();
+      touchSnapshot = {};
+      touchSnapshot.idsStable = true;
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
       touchUpPoint = touchPoint;
@@ -2266,15 +2320,64 @@ void InputManager::pollTma525c(const unsigned long now) {
   const uint16_t len = piccoReadReport(t.i2cAddress, buf, sizeof(buf));
   if (len < 7 || buf[2] != PICCO_REPORT_TOUCH) return;
   const uint8_t count = buf[5] & 0x1F;
-  const uint8_t* rec = &buf[7];
-  const bool lifted = count == 0 || len < 17 || ((rec[1] >> 5) & 0x03) == 3;
-#ifdef TOUCH_PROBE_DEBUG
-  if (len >= 17)
-    touchDebugPrintf("[touch] Picco n=%u id=%u ev=%u x=%u y=%u\r\n", count, rec[1] & 0x1F, (rec[1] >> 5) & 0x03,
-                     rec[2] | (rec[3] << 8), rec[4] | (rec[5] << 8));
-#endif
+  constexpr uint8_t headerBytes = 7;
+  constexpr uint8_t recordBytes = 10;
+  if (count > MAX_TOUCH_CONTACTS || len < headerBytes + count * recordBytes) {
+    // Never reinterpret a truncated/malformed multi-contact frame as one finger
+    // or a release: either could turn an incomplete gesture into a UI action.
+    blockMultiTouchGesture();
+    touchSnapshot = {};
+    touchSnapshot.idsStable = true;
+    touchSnapshot.reportedCount = count;
+    LOG_ERR("INPUT", "Invalid Picco touch report: contacts=%u bytes=%u", count, len);
+    return;
+  }
 
-  if (lifted) {
+  // Bounded alongside the existing 128-byte report buffer; no heap allocation.
+  TouchSnapshot next{};
+  next.idsStable = true;
+  for (uint8_t i = 0; i < count; ++i) {
+    const uint8_t* rec = &buf[headerBytes + i * recordBytes];
+    if (((rec[1] >> 5) & 0x03) == 3) continue;  // explicit lift-off record
+    const uint8_t id = rec[1] & 0x1F;
+    const uint16_t x = static_cast<uint16_t>(rec[2]) | (static_cast<uint16_t>(rec[3]) << 8);
+    const uint16_t y = static_cast<uint16_t>(rec[4]) | (static_cast<uint16_t>(rec[5]) << 8);
+    bool duplicate = false;
+    for (uint8_t j = 0; j < next.count; ++j) duplicate |= next.points[j].id == id;
+    if (x > PICCO_TOUCH_W || y > PICCO_TOUCH_H || duplicate) {
+      blockMultiTouchGesture();
+      touchSnapshot = {};
+      touchSnapshot.idsStable = true;
+      touchSnapshot.reportedCount = count;
+      LOG_ERR("INPUT", "Invalid Picco contact: id=%u x=%u y=%u", id, x, y);
+      return;
+    }
+    const uint16_t px = PICCO_TOUCH_W - x;  // stock orientation
+    const uint16_t py = PICCO_TOUCH_H - y;
+    const uint16_t sx = t.swapXY ? py : px;
+    const uint16_t sy = t.swapXY ? px : py;
+    auto& contact = next.points[next.count++];
+    contact.id = id;
+    contact.point.valid = true;
+    contact.point.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
+    contact.point.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
+    if (t.flipX) contact.point.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - contact.point.x);
+    if (t.flipY) contact.point.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - contact.point.y);
+    contact.point.timestamp = now;
+  }
+  next.reportedCount = next.count;
+  // A lift and another finger's down can share a report with only one live
+  // contact. Do not let that new ID inherit the old finger's tap/swipe origin.
+  if (touchPressed && touchSnapshot.count == 1 && next.count == 1 && touchSnapshot.points[0].id != next.points[0].id) {
+    blockMultiTouchGesture();
+  }
+  touchSnapshot = next;
+  if (piccoMaxContacts >= 2)
+    updateMultiTouchGesture(touchSnapshot, now);
+  else if (next.count > 1)
+    blockMultiTouchGesture();
+
+  if (next.count == 0) {
     if (touchPressed) {
       touchReleasedEvent = true;
       lastTouchHeldDurationMs = now - touchDownPoint.timestamp;
@@ -2285,19 +2388,7 @@ void InputManager::pollTma525c(const unsigned long now) {
     return;
   }
 
-  const uint16_t x = static_cast<uint16_t>(rec[2] | (rec[3] << 8));
-  const uint16_t y = static_cast<uint16_t>(rec[4] | (rec[5] << 8));
-  if (x > PICCO_TOUCH_W || y > PICCO_TOUCH_H) return;
-  const uint16_t px = PICCO_TOUCH_W - x;  // stock orientation
-  const uint16_t py = PICCO_TOUCH_H - y;
-  const uint16_t sx = t.swapXY ? py : px;
-  const uint16_t sy = t.swapXY ? px : py;
-  touchPoint.valid = true;
-  touchPoint.x = mapTouchAxis(sx, t.rawMinX, t.rawMaxX, t.rawMaxX - t.rawMinX);
-  touchPoint.y = mapTouchAxis(sy, t.rawMinY, t.rawMaxY, t.rawMaxY - t.rawMinY);
-  if (t.flipX) touchPoint.x = static_cast<uint16_t>((t.rawMaxX - t.rawMinX) - touchPoint.x);
-  if (t.flipY) touchPoint.y = static_cast<uint16_t>((t.rawMaxY - t.rawMinY) - touchPoint.y);
-  touchPoint.timestamp = now;
+  touchPoint = next.points[0].point;
   if (!touchPressed) {
     touchPressedEvent = true;
     touchDownPoint = touchPoint;
@@ -2305,11 +2396,15 @@ void InputManager::pollTma525c(const unsigned long now) {
     touchMovedBeyondTapReleaseSlop = false;
   }
   touchUpPoint = touchPoint;
-  const int dx = static_cast<int>(touchUpPoint.x) - static_cast<int>(touchDownPoint.x);
-  const int dy = static_cast<int>(touchUpPoint.y) - static_cast<int>(touchDownPoint.y);
+  const int dx = static_cast<int>(touchUpPoint.x) - touchDownPoint.x;
+  const int dy = static_cast<int>(touchUpPoint.y) - touchDownPoint.y;
   if (absInt(dx) > TOUCH_TAP_SLOP_PX || absInt(dy) > TOUCH_TAP_SLOP_PX) touchMovedBeyondTapSlop = true;
   if (absInt(dx) > TOUCH_TAP_RELEASE_SLOP_PX || absInt(dy) > TOUCH_TAP_RELEASE_SLOP_PX)
     touchMovedBeyondTapReleaseSlop = true;
+  if (next.count > 1) {
+    touchMovedBeyondTapSlop = true;
+    touchMovedBeyondTapReleaseSlop = true;
+  }
   touchPressed = true;
   touchReleaseAt = now + PICCO_TOUCH_STALE_MS;
 }
