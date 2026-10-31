@@ -75,6 +75,15 @@ class Uc8179Driver : public PanelDriver {
   void requestResync(uint8_t settlePasses) override;
   void skipInitialResync() override;
 
+  // Refresh one rectangle with the DU partial narrowed by PTL (0x90): pixels
+  // outside it are not driven at all. The whole-panel DU drives every pixel
+  // the planes hold as white-on-white toward white, so a caller whose planes
+  // carry only the changed region (a clock's time box) would wear the rest of
+  // the panel away. x and w must be multiples of 8; anything that makes a
+  // differential partial invalid falls back to the whole-panel Fast path.
+  void displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y, uint16_t w,
+                     uint16_t h, bool turnOff) override;
+
   // --- 4-level grayscale (anti-aliasing) ---
   // CrossPoint supplies two full 1bpp overlay masks. The driver combines them
   // with the displayed B/W base to recover Factory.bin's absolute 2-bit planes,
@@ -168,6 +177,16 @@ class Uc8179Driver : public PanelDriver {
   bool _pendingRefresh = false;
   bool _pendingTurnOff = false;
   bool _pendingPartial = false;  // this refresh used the PTIN/PTOUT partial path
+
+  // displayWindow() state: the window for the refresh in flight, and whether
+  // the controller still holds a narrowed PTL (a later PTIN would reuse it;
+  // the next refresh re-initializes the controller instead).
+  bool _winActive = false;
+  uint16_t _winX = 0;
+  uint16_t _winY = 0;
+  uint16_t _winW = 0;
+  uint16_t _winH = 0;
+  bool _ptlNarrowed = false;
 };
 
 PanelDriver& uc8179Driver();

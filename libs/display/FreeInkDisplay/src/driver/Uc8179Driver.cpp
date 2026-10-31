@@ -341,6 +341,15 @@ void Uc8179Driver::streamPlaneXor(EpdBus& bus, uint8_t ramCmd, const uint8_t* lh
 }
 
 bool Uc8179Driver::displayStart(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, RefreshMode mode, bool turnOff) {
+  if (_ptlNarrowed && !_winActive) {
+    // A window refresh left PTL narrowed, and PTIN would reuse it: start the
+    // controller over (its RAM is then unknown, so this refresh is a full one).
+    bus.reset(50);
+    initController(bus);
+    _ptlNarrowed = false;
+    _needFullClear = true;
+    _oldPlaneValid = false;
+  }
   const bool paintDestination = _directGrayOnPanel;
   _directGrayOnPanel = false;
   restoreBwConfiguration(bus);
@@ -436,7 +445,29 @@ void Uc8179Driver::startBwRefresh(EpdBus& bus, bool fast) {
     _isScreenOn = true;
   }
 
-  if (fast) bus.cmd(CMD_PARTIAL_IN);  // PTIN — whole-panel partial (no 0x90 window)
+  if (fast) {
+    bus.cmd(CMD_PARTIAL_IN);  // PTIN — whole-panel partial unless displayWindow() set one
+    if (_winActive) {
+      // PTL in RAM coordinates: columns as streamed (SHL turns them on the
+      // panel), rows reversed (streamPlane sends the framebuffer's last row
+      // first), byte-aligned along the columns.
+      const uint16_t xStart = _winX;
+      const uint16_t xEnd = static_cast<uint16_t>(_winX + _winW - 1);
+      const uint16_t yStart = static_cast<uint16_t>(_h - (_winY + _winH));
+      const uint16_t yEnd = static_cast<uint16_t>(_h - 1 - _winY);
+      bus.cmd(CMD_PARTIAL_WINDOW);
+      bus.data(static_cast<uint8_t>(xStart >> 8));
+      bus.data(static_cast<uint8_t>(xStart & 0xF8));
+      bus.data(static_cast<uint8_t>(xEnd >> 8));
+      bus.data(static_cast<uint8_t>((xEnd & 0xFF) | 0x07));
+      bus.data(static_cast<uint8_t>(yStart >> 8));
+      bus.data(static_cast<uint8_t>(yStart & 0xFF));
+      bus.data(static_cast<uint8_t>(yEnd >> 8));
+      bus.data(static_cast<uint8_t>(yEnd & 0xFF));
+      bus.data(0x01);  // PT_SCAN: gates scan inside and outside the window
+      _ptlNarrowed = true;
+    }
+  }
   bus.cmd(CMD_DISPLAY_REFRESH);
   // Confirm the waveform started (BUSY dropped) before returning, so
   // displayFinish() only rides out the completion edge.
@@ -482,6 +513,30 @@ void Uc8179Driver::requestResync(uint8_t settlePasses) {
 }
 
 void Uc8179Driver::skipInitialResync() { _needFullClear = false; }
+
+void Uc8179Driver::displayWindow(EpdBus& bus, const uint8_t* fb, const uint8_t* prev, uint16_t x, uint16_t y,
+                                 uint16_t w, uint16_t h, bool turnOff) {
+  const bool alignable = (x % 8 == 0) && (w % 8 == 0);
+  const bool inBounds = w > 0 && h > 0 && static_cast<uint32_t>(x) + w <= _w && static_cast<uint32_t>(y) + h <= _h;
+  const bool whole = x == 0 && y == 0 && w == _w && h == _h;
+  // A window is a differential DU against the OLD plane: it needs a real
+  // baseline, and the first Fast after a gray pass needs display()'s
+  // whole-panel re-drive instead.
+  const bool diffValid = _oldPlaneValid && !_needFullClear && !_redriveAfterGray && !_directGrayConfigured;
+  if (!fb || !alignable || !inBounds || whole || !diffValid) {
+    display(bus, fb, prev, RefreshMode::Fast, turnOff);
+    return;
+  }
+  _winActive = true;
+  _winX = x;
+  _winY = y;
+  _winW = w;
+  _winH = h;
+  // The planes still go up whole (DTM2 before, DTM1 after, as for any
+  // partial); only the waveform is confined to the window.
+  if (displayStart(bus, fb, prev, RefreshMode::Fast, turnOff)) displayFinish(bus, fb);
+  _winActive = false;
+}
 
 void Uc8179Driver::deepSleep(EpdBus& bus) {
   _directGrayOnPanel = false;
